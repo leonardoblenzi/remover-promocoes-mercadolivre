@@ -26,14 +26,44 @@ TENTATIVAS_MAX = 3
 TIMEOUT_PAGINA = 60  # segundos
 ARQUIVO_FALHAS = "mlbs_falhados.txt"
 
-EDGE_PROFILE_PATH = r"C:\Users\USER\AppData\Local\Microsoft\Edge\User Data"
-EDGE_PROFILE_NAME = "Profile 1"
+# Configurações de perfis
+PERFIS = {
+    "Diplany": {
+        "profile_path": r"C:\Users\USER\AppData\Local\Microsoft\Edge\User Data",
+        "profile_name": "Profile 1",
+        "planilha": r"C:\Users\USER\PycharmProjects\Remove Promo\DATA\Correcao Preco Diplany.xlsx"
+    },
+    "Rossi Decor": {
+        "profile_path": r"C:\Users\USER\AppData\Local\Microsoft\Edge\User Data",
+        "profile_name": "Profile 2",
+        "planilha": r"C:\Users\USER\PycharmProjects\Remove Promo\DATA\Correcao Preco Rossi.xlsx"
+    }
+}
+
 EDGE_DRIVER_PATH = r"C:\WebDriver\msedgedriver.exe"
 EDGE_BINARY_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 DEBUG_PORT = 9222
 
 
 # ===== FUNÇÕES =====
+def selecionar_perfil():
+    """Permite ao usuário selecionar qual perfil usar"""
+    print("\n📌 Selecione o perfil:")
+    for i, perfil in enumerate(PERFIS.keys(), 1):
+        print(f"{i}. {perfil}")
+
+    while True:
+        try:
+            escolha = int(input("Digite o número do perfil: "))
+            if 1 <= escolha <= len(PERFIS):
+                nome_perfil = list(PERFIS.keys())[escolha - 1]
+                print(f"\n✅ Perfil selecionado: {nome_perfil}")
+                return nome_perfil
+            print("⚠️ Opção inválida. Tente novamente.")
+        except ValueError:
+            print("⚠️ Digite apenas números.")
+
+
 def verificar_porta_debug():
     """Verifica se a porta de depuração está respondendo"""
     try:
@@ -58,13 +88,14 @@ def matar_processos_edge():
     time.sleep(5)
 
 
-def iniciar_edge_com_debug():
+def iniciar_edge_com_debug(perfil):
     """Inicia o Edge manualmente com porta de depuração"""
     print("🚀 Iniciando Edge com depuração remota...")
+    profile_data = PERFIS[perfil]
     cmd = [
         EDGE_BINARY_PATH,
-        f"--user-data-dir={EDGE_PROFILE_PATH}",
-        f"--profile-directory={EDGE_PROFILE_NAME}",
+        f"--user-data-dir={profile_data['profile_path']}",
+        f"--profile-directory={profile_data['profile_name']}",
         f"--remote-debugging-port={DEBUG_PORT}",
         "--no-first-run",
         "about:blank"
@@ -102,8 +133,9 @@ def conectar_selenium():
         return None
 
 
-def verificar_ambiente():
+def verificar_ambiente(perfil):
     """Verifica se todos os requisitos estão atendidos"""
+    profile_data = PERFIS[perfil]
     erros = []
 
     if not os.path.exists(EDGE_DRIVER_PATH):
@@ -112,8 +144,8 @@ def verificar_ambiente():
     if not os.path.exists(EDGE_BINARY_PATH):
         erros.append(f"Executável do Edge não encontrado em: {EDGE_BINARY_PATH}")
 
-    if not os.path.exists(ARQUIVO_PLANILHA):
-        erros.append(f"Planilha não encontrada: {ARQUIVO_PLANILHA}")
+    if not os.path.exists(profile_data['planilha']):
+        erros.append(f"Planilha não encontrada: {profile_data['planilha']}")
 
     if erros:
         print("\n❌ Erros de configuração:")
@@ -135,7 +167,7 @@ def reconectar_driver(driver):
         pass
 
     matar_processos_edge()
-    if not iniciar_edge_com_debug():
+    if not iniciar_edge_com_debug(perfil_selecionado):
         raise Exception("Falha ao reiniciar o navegador")
 
     new_driver = conectar_selenium()
@@ -205,7 +237,7 @@ def processar_promocao(driver, botao, mlb):
         return False
 
 
-def remover_promocoes(driver, mlb):
+def remover_promocoes(driver, mlb, perfil):
     """Remove todas as promoções de um anúncio com tratamento robusto"""
     url = f"https://www.mercadolivre.com.br/anuncios/lista/promos/?search={mlb}"
     promocoes_removidas = 0
@@ -248,17 +280,19 @@ def remover_promocoes(driver, mlb):
                     print(f"❌ Falha ao reconectar: {reconect_error}")
                     break
             else:
-                driver.save_screenshot(f"erro_mlb_{mlb}.png")
+                driver.save_screenshot(f"erro_mlb_{mlb}_{perfil}.png")
 
     return promocoes_removidas
 
 
 # ===== EXECUÇÃO PRINCIPAL =====
 def main():
-    verificar_ambiente()
+    global perfil_selecionado
+    perfil_selecionado = selecionar_perfil()
+    verificar_ambiente(perfil_selecionado)
     matar_processos_edge()
 
-    if not iniciar_edge_com_debug():
+    if not iniciar_edge_com_debug(perfil_selecionado):
         sys.exit(1)
 
     print("🔗 Conectando Selenium...")
@@ -269,7 +303,8 @@ def main():
     print(f"✅ Edge conectado com sucesso via porta {DEBUG_PORT}")
 
     try:
-        df = pd.read_excel(ARQUIVO_PLANILHA)
+        planilha_path = PERFIS[perfil_selecionado]['planilha']
+        df = pd.read_excel(planilha_path)
         mlbs = df[COLUNA_MLB].dropna().astype(str).str.strip().tolist()
         print(f"\n📊 Total de anúncios a processar: {len(mlbs)}")
     except Exception as e:
@@ -290,7 +325,7 @@ def main():
         print(f"\n🔎 Processando {i}/{len(mlbs)} - MLB: {mlb}")
 
         try:
-            removidas = remover_promocoes(driver, mlb)
+            removidas = remover_promocoes(driver, mlb, perfil_selecionado)
 
             if removidas == 0:
                 falhas.append(mlb)
@@ -313,13 +348,14 @@ def main():
 
     # Salva os mlbs que falharam
     if falhas:
-        with open(ARQUIVO_FALHAS, "w", encoding="utf-8") as f:
+        nome_arquivo = f"mlbs_falhados_{perfil_selecionado.replace(' ', '_')}.txt"
+        with open(nome_arquivo, "w", encoding="utf-8") as f:
             f.write("\n".join(falhas))
-        print(f"\n⚠️ Alguns anúncios não tiveram promoções removidas. Lista salva em {ARQUIVO_FALHAS}")
+        print(f"\n⚠️ Alguns anúncios não tiveram promoções removidas. Lista salva em {nome_arquivo}")
 
     driver.quit()
     print("\n" + "=" * 50)
-    print(f"✅ PROCESSO CONCLUÍDO")
+    print(f"✅ PROCESSO CONCLUÍDO - Perfil: {perfil_selecionado}")
     print(f"🔹 Total de anúncios processados: {len(mlbs)}")
     print(f"🔹 Total de promoções removidas: {total_promocoes_removidas}")
     print(f"🔹 Anúncios já sem promoções: {total_sem_promocao}")
@@ -328,4 +364,5 @@ def main():
 
 
 if __name__ == "__main__":
+    perfil_selecionado = ""
     main()
