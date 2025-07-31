@@ -5,18 +5,25 @@ import psutil
 import pandas as pd
 import subprocess
 import requests
+import socket
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.edge.service import Service
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (NoSuchElementException,
+                                        WebDriverException,
+                                        TimeoutException)
+from urllib3.exceptions import ReadTimeoutError
 
 # ===== CONFIGURAÇÕES =====
-ARQUIVO_PLANILHA = r"C:\Users\USER\PycharmProjects\Remove Promo\DATA\PREÇO CORRIGIR FRETE GRATIS SEM 12.xlsx"
+ARQUIVO_PLANILHA = r"C:\Users\USER\PycharmProjects\Remove Promo\DATA\Correcao Preco Diplany.xlsx"
 COLUNA_MLB = "CODIGO_ANUNCIO"
 TEMPO_ESPERA = 5
-TEMPO_ESPERA_EXTRA = 3  # tempo adicional entre ações
+TEMPO_ESPERA_EXTRA = 3
 TENTATIVAS_MAX = 3
+TIMEOUT_PAGINA = 60  # segundos
 ARQUIVO_FALHAS = "mlbs_falhados.txt"
 
 EDGE_PROFILE_PATH = r"C:\Users\USER\AppData\Local\Microsoft\Edge\User Data"
@@ -39,12 +46,15 @@ def verificar_porta_debug():
 def matar_processos_edge():
     """Encerra todos os processos do Edge de forma robusta"""
     print("🔴 Encerrando processos do Edge...")
+    processos_mortos = 0
     for proc in psutil.process_iter(['pid', 'name']):
         try:
             if proc.info['name'] and any(x in proc.info['name'].lower() for x in ['msedge', 'edge']):
                 proc.kill()
+                processos_mortos += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
+    print(f"✔️ {processos_mortos} processos encerrados")
     time.sleep(5)
 
 
@@ -62,6 +72,8 @@ def iniciar_edge_com_debug():
 
     try:
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # Aguarda até 30 segundos pela porta de depuração
         for _ in range(30):
             if verificar_porta_debug():
                 return True
@@ -82,6 +94,7 @@ def conectar_selenium():
     try:
         service = Service(executable_path=EDGE_DRIVER_PATH)
         driver = webdriver.Edge(service=service, options=options)
+        driver.set_page_load_timeout(TIMEOUT_PAGINA)
         driver.get("about:blank")  # Teste de conexão
         return driver
     except Exception as e:
@@ -112,78 +125,130 @@ def verificar_ambiente():
         sys.exit(1)
 
 
-def remover_promocoes(driver, mlb):
-    """
-    Remove todas as promoções de um anúncio (diretas ou via popup).
-    Retorna a quantidade de promoções removidas.
-    """
-    url = f"https://www.mercadolivre.com.br/anuncios/lista/promos/?search={mlb}"
-    driver.get(url)
-    time.sleep(TEMPO_ESPERA)
+def reconectar_driver(driver):
+    """Reinicia completamente o navegador e driver"""
+    print("🔄 Reconectando o navegador...")
+    try:
+        if driver:
+            driver.quit()
+    except:
+        pass
 
+    matar_processos_edge()
+    if not iniciar_edge_com_debug():
+        raise Exception("Falha ao reiniciar o navegador")
+
+    new_driver = conectar_selenium()
+    if not new_driver:
+        raise Exception("Falha ao reconectar o Selenium")
+
+    return new_driver
+
+
+def encontrar_botoes_promocao(driver):
+    """Localiza todos os botões relevantes para remoção de promoções"""
+    try:
+        return WebDriverWait(driver, 10).until(
+            EC.presence_of_all_elements_located((By.XPATH,
+                                                 "//button[contains(., 'Deixar de participar') or "
+                                                 "contains(., 'Alterar') or "
+                                                 "contains(., 'Remover promoção')]")))
+    except TimeoutException:
+        return []
+
+
+def processar_promocao(driver, botao, mlb):
+    """Processa um botão de promoção individual"""
+    try:
+        texto = botao.text.strip()
+        driver.execute_script("arguments[0].scrollIntoView();", botao)
+        driver.execute_script("arguments[0].click();", botao)
+        time.sleep(TEMPO_ESPERA)
+
+        if "Deixar de participar" in texto:
+            # Confirmar no popup
+            try:
+                confirmar = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH,
+                                                "//button[contains(., 'Confirmar') or "
+                                                "contains(., 'Deixar de participar') or "
+                                                "contains(., 'Sim')]")))
+                confirmar.click()
+                time.sleep(TEMPO_ESPERA)
+                return True
+            except:
+                return False
+
+        elif "Alterar" in texto or "Remover promoção" in texto:
+            # Clicar no botão "Deixar de participar" no popup
+            try:
+                deixar = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH,
+                                                "//button[contains(., 'Deixar de participar')]")))
+                deixar.click()
+                time.sleep(TEMPO_ESPERA)
+
+                # Confirmar no segundo popup
+                try:
+                    confirmar = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.XPATH,
+                                                    "//button[contains(., 'Confirmar') or "
+                                                    "contains(., 'Deixar de participar')]")))
+                    confirmar.click()
+                    time.sleep(TEMPO_ESPERA)
+                    return True
+                except:
+                    return False
+            except:
+                return False
+    except:
+        return False
+
+
+def remover_promocoes(driver, mlb):
+    """Remove todas as promoções de um anúncio com tratamento robusto"""
+    url = f"https://www.mercadolivre.com.br/anuncios/lista/promos/?search={mlb}"
     promocoes_removidas = 0
 
-    while True:
-        promocoes_restantes = False
+    for tentativa in range(1, TENTATIVAS_MAX + 1):
         try:
-            acoes = driver.find_elements(By.XPATH, "//button[contains(., 'Deixar de participar') or contains(., 'Alterar')]")
-            if not acoes:
-                break
+            try:
+                driver.get(url)
+                time.sleep(TEMPO_ESPERA)
+            except (socket.timeout, ReadTimeoutError, WebDriverException) as e:
+                print(f"⚠️ Timeout ao carregar página (Tentativa {tentativa}): {str(e)[:100]}")
+                if tentativa == TENTATIVAS_MAX:
+                    raise
+                continue
 
-            for acao in acoes:
-                promocoes_restantes = True
-                texto = acao.text.strip()
+            while True:
+                botoes = encontrar_botoes_promocao(driver)
+                if not botoes:
+                    break
 
-                # Caso o botão direto "Deixar de participar" esteja visível
-                if "Deixar de participar" in texto:
-                    acao.click()
-                    time.sleep(TEMPO_ESPERA)
-
-                    # Confirmar no segundo popup (botão azul)
-                    try:
-                        confirmar_final = driver.find_element(By.XPATH, "//button[contains(., 'Deixar de participar')]")
-                        confirmar_final.click()
+                for botao in botoes:
+                    if processar_promocao(driver, botao, mlb):
                         promocoes_removidas += 1
-                        print(f"✔️ Promoção removida diretamente - {mlb}")
-                    except NoSuchElementException:
-                        print(f"⚠️ Confirmação final não encontrada - {mlb}")
+                        print(f"✔️ Promoção removida (Tentativa {tentativa}) - {mlb}")
+                    else:
+                        print(f"⚠️ Falha ao processar botão (Tentativa {tentativa}) - {mlb}")
 
-                    time.sleep(TEMPO_ESPERA_EXTRA)
+                # Verifica se ainda há promoções
+                driver.get(url)
+                time.sleep(TEMPO_ESPERA)
 
-                # Caso precise clicar em "Alterar"
-                elif "Alterar" in texto:
-                    acao.click()
-                    time.sleep(TEMPO_ESPERA)
-
-                    try:
-                        deixar = driver.find_element(By.XPATH, "//button[contains(., 'Deixar de participar')]")
-                        deixar.click()
-                        time.sleep(TEMPO_ESPERA)
-
-                        # Confirmar no segundo popup (botão azul)
-                        try:
-                            confirmar_final = driver.find_element(By.XPATH, "//button[contains(., 'Deixar de participar')]")
-                            confirmar_final.click()
-                            promocoes_removidas += 1
-                            print(f"✔️ Promoção removida via popup - {mlb}")
-                        except NoSuchElementException:
-                            print(f"⚠️ Confirmação final não encontrada - {mlb}")
-
-                    except NoSuchElementException:
-                        print(f"⚠️ Botão 'Deixar de participar' não encontrado no popup - {mlb}")
-
-                    time.sleep(TEMPO_ESPERA_EXTRA)
-
-            # Atualiza a página para verificar se restam promoções
-            driver.get(url)
-            time.sleep(TEMPO_ESPERA)
+            return promocoes_removidas
 
         except Exception as e:
-            print(f"❌ Erro ao processar {mlb}: {str(e)[:200]}")
-            break
-
-        if not promocoes_restantes:
-            break
+            print(f"❌ Erro ao processar {mlb} (Tentativa {tentativa}): {str(e)[:200]}")
+            if tentativa < TENTATIVAS_MAX:
+                try:
+                    driver = reconectar_driver(driver)
+                except Exception as reconect_error:
+                    print(f"❌ Falha ao reconectar: {reconect_error}")
+                    break
+            else:
+                driver.save_screenshot(f"erro_mlb_{mlb}.png")
 
     return promocoes_removidas
 
@@ -223,17 +288,28 @@ def main():
             continue
 
         print(f"\n🔎 Processando {i}/{len(mlbs)} - MLB: {mlb}")
-        removidas = remover_promocoes(driver, mlb)
 
-        if removidas == 0:
+        try:
+            removidas = remover_promocoes(driver, mlb)
+
+            if removidas == 0:
+                falhas.append(mlb)
+                total_sem_promocao += 1
+                print(f"⚠️ Nenhuma promoção removida - {mlb}")
+            else:
+                total_promocoes_removidas += removidas
+                print(f"✅ {removidas} promoção(ões) removida(s) - {mlb}")
+
+            time.sleep(TEMPO_ESPERA_EXTRA)
+
+        except Exception as e:
+            print(f"❌ Erro crítico ao processar {mlb}: {str(e)[:200]}")
             falhas.append(mlb)
-            total_sem_promocao += 1
-            print(f"⚠️ Nenhuma promoção removida ou anúncio já estava sem promoções - {mlb}")
-        else:
-            total_promocoes_removidas += removidas
-            print(f"✅ {removidas} promoção(ões) removida(s) do anúncio {mlb}")
-
-        time.sleep(TEMPO_ESPERA_EXTRA)
+            try:
+                driver = reconectar_driver(driver)
+            except Exception as reconect_error:
+                print(f"❌ Falha ao reconectar: {reconect_error}")
+                break
 
     # Salva os mlbs que falharam
     if falhas:
